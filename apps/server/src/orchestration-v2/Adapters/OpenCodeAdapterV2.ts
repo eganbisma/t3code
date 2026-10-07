@@ -2079,24 +2079,30 @@ export function makeOpenCodeAdapterV2(
             request.value,
           );
           if (decision === undefined || decision === "ask") return false;
-          rememberSettledRequest(nativeRequestId);
           // A policy deny is answered as a rejection: the tool fails under the
           // same rule it would have been denied by once its rules install. An
           // allow is answered once: the session rules that land will govern
-          // everything after this request.
+          // everything after this request. Only mark the request settled after
+          // the reply lands. A failed reply falls through so routing can
+          // surface a request the user can still respond to.
           const reply = decision === "deny" ? ("reject" as const) : ("once" as const);
-          yield* sdkCall("permission.reply", { requestID: nativeRequestId, reply }, () =>
-            client.permission.reply({ requestID: nativeRequestId, reply }),
+          const delivered = yield* sdkCall(
+            "permission.reply",
+            { requestID: nativeRequestId, reply },
+            () => client.permission.reply({ requestID: nativeRequestId, reply }),
           ).pipe(
+            Effect.as(true),
             Effect.catchCause((cause) =>
               Effect.logWarning("Failed to auto-answer an OpenCode permission request", {
                 nativeRequestId,
                 permission: request.value.permission,
                 reply,
                 cause: causeErrorTag(cause),
-              }),
+              }).pipe(Effect.as(false)),
             ),
           );
+          if (!delivered) return false;
+          rememberSettledRequest(nativeRequestId);
           return true;
         });
 

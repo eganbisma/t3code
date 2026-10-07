@@ -812,6 +812,192 @@ describe("OpenCodeAdapterV2", () => {
     }).pipe(Effect.provide(IdAllocator.layer), Effect.scoped),
   );
 
+  // The auto-answer path must not leave a child stuck with no way to
+  // respond: a failed reply has to fall back to a surfaced approval.
+  it.effect("surfaces a child's permission request when the automatic reply fails", () =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      const push = (event: unknown) => Effect.promise(() => nativeEvents.push(event));
+      const root = "ses_root";
+      const child = "ses_child";
+      let promptId = "";
+      const replies: Array<string> = [];
+      const replied = promiseGate<void>();
+      const harness = yield* makeOpenCodeRuntimeHarness("child-reply-fallback", root, {
+        event: {
+          subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+            options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
+            return { stream: nativeEvents.stream };
+          },
+        },
+        session: {
+          create: async () => ({ data: { id: root, time: { created: 1, updated: 1 } } }),
+          get: async () => ({
+            data: { id: child, parentID: root, permission: [], time: { created: 2, updated: 2 } },
+          }),
+          update: async () => ({ data: { id: child, parentID: root } }),
+          promptAsync: async (input: { messageID: string }) => {
+            promptId = input.messageID;
+            return { data: true };
+          },
+          abort: async () => ({ data: true }),
+          children: async () => ({ data: [] }),
+        },
+        permission: {
+          reply: async (input: { reply: string }) => {
+            replies.push(input.reply);
+            replied.resolve();
+            throw new Error("permission service unavailable");
+          },
+        },
+      });
+      const collected = yield* harness.runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* harness.startTurn();
+      yield* push({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: { id: promptId, sessionID: root, role: "user", time: { created: 1 } },
+        },
+      });
+      yield* push({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      yield* push({
+        type: "session.created",
+        properties: {
+          sessionID: child,
+          info: { id: child, parentID: root, time: { created: 2, updated: 2 } },
+        },
+      });
+      yield* push({
+        type: "permission.asked",
+        properties: {
+          id: "req_child_read",
+          sessionID: child,
+          permission: "read",
+          patterns: ["web/src/routes/settings.tsx"],
+          always: ["*"],
+          metadata: {},
+        },
+      });
+      yield* Effect.promise(() => replied.promise);
+      yield* push({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const events = yield* Fiber.join(collected);
+      // The failed auto-reply surfaces a request instead of dropping it.
+      assert.equal(replies.length, 1);
+      assert.equal(replies[0], "once");
+      const surfaced = events.find((event) => event.type === "runtime_request.updated");
+      assert.ok(
+        surfaced?.type === "runtime_request.updated",
+        "a failed auto-reply must surface a respondable request",
+      );
+      assert.equal(surfaced.runtimeRequest.status, "pending");
+      assert.equal(surfaced.runtimeRequest.kind, "file-read");
+    }).pipe(Effect.provide(IdAllocator.layer), Effect.scoped),
+  );
+
+  it.effect("answers a child's permission request once the reply is delivered", () =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      const push = (event: unknown) => Effect.promise(() => nativeEvents.push(event));
+      const root = "ses_root";
+      const child = "ses_child";
+      let promptId = "";
+      const replies: Array<string> = [];
+      const replied = promiseGate<void>();
+      const harness = yield* makeOpenCodeRuntimeHarness("child-reply-delivered", root, {
+        event: {
+          subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+            options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
+            return { stream: nativeEvents.stream };
+          },
+        },
+        session: {
+          create: async () => ({ data: { id: root, time: { created: 1, updated: 1 } } }),
+          get: async () => ({
+            data: { id: child, parentID: root, permission: [], time: { created: 2, updated: 2 } },
+          }),
+          update: async () => ({ data: { id: child, parentID: root } }),
+          promptAsync: async (input: { messageID: string }) => {
+            promptId = input.messageID;
+            return { data: true };
+          },
+          abort: async () => ({ data: true }),
+          children: async () => ({ data: [] }),
+        },
+        permission: {
+          reply: async (input: { reply: string }) => {
+            replies.push(input.reply);
+            replied.resolve();
+            return { data: true };
+          },
+        },
+      });
+      const collected = yield* harness.runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* harness.startTurn();
+      yield* push({
+        type: "message.updated",
+        properties: {
+          sessionID: root,
+          info: { id: promptId, sessionID: root, role: "user", time: { created: 1 } },
+        },
+      });
+      yield* push({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "busy" } },
+      });
+      yield* push({
+        type: "session.created",
+        properties: {
+          sessionID: child,
+          info: { id: child, parentID: root, time: { created: 2, updated: 2 } },
+        },
+      });
+      yield* push({
+        type: "permission.asked",
+        properties: {
+          id: "req_child_read",
+          sessionID: child,
+          permission: "read",
+          patterns: ["web/src/routes/settings.tsx"],
+          always: ["*"],
+          metadata: {},
+        },
+      });
+      yield* Effect.promise(() => replied.promise);
+      // A delivered reply is the only sign: no runtime request is created,
+      // and the request id is marked settled so a later reply is a no-op.
+      yield* push({
+        type: "permission.replied",
+        properties: { requestID: "req_child_read", sessionID: child, reply: "once" },
+      });
+      yield* push({
+        type: "session.status",
+        properties: { sessionID: root, status: { type: "idle" } },
+      });
+      const events = yield* Fiber.join(collected);
+      assert.deepEqual(
+        events.filter((event) => event.type === "runtime_request.updated"),
+        [],
+      );
+      assert.equal(replies.length, 1);
+      assert.equal(replies[0], "once");
+    }).pipe(Effect.provide(IdAllocator.layer), Effect.scoped),
+  );
+
   it.effect("titles OpenCode reads and searches from their input", () =>
     Effect.gen(function* () {
       const nativeEvents = asyncEventStream();
