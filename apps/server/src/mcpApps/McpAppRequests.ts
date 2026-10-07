@@ -210,7 +210,8 @@ const make = Effect.gen(function* () {
     if (input.structuredContent !== undefined) {
       texts.push(encodeJson(input.structuredContent));
     }
-    const text = texts.join("\n").trim();
+    // Kept as sent; blank text clears the app's context in the store.
+    const text = texts.join("\n");
     if (utf8.encode(text).byteLength > McpAppModelContext.MCP_APP_MODEL_CONTEXT_MAX_BYTES) {
       return yield* fail(
         input.threadId,

@@ -175,10 +175,12 @@ describe("McpAppRequests", () => {
     Effect.gen(function* () {
       const requests = yield* McpAppRequests.McpAppRequests;
       const own = { threadId, itemId, conversationThreadId: threadId };
+      // The app's text is stored as sent, whitespace included.
       yield* requests.updateModelContext({
         ...own,
-        content: [{ type: "text", text: "Showing 2 todos" }],
+        content: [{ type: "text", text: "  indented value  " }],
       });
+      assert.equal(storedContext.get(`${threadId}/${itemId}`), "  indented value  ");
       // An update replaces the app's context rather than adding to it.
       yield* requests.updateModelContext({
         ...own,

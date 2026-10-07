@@ -350,10 +350,14 @@ export function McpAppFrame(props: {
       },
       requestDisplayMode: async (mode) => {
         // Full screen would cover the approval or question the agent waits
-        // on, or a confirmation any app is waiting on.
+        // on, or a confirmation any app is waiting on. Another app already
+        // full screen keeps the page; two would stack.
+        const otherFullscreen = document.querySelector("[data-mcp-app-fullscreen]");
         if (
           mode === "fullscreen" &&
-          (latest.current.props.awaitingUser === true || isConfirmDialogActive())
+          (latest.current.props.awaitingUser === true ||
+            isConfirmDialogActive() ||
+            (otherFullscreen !== null && otherFullscreen !== boxRef.current))
         ) {
           return latest.current.displayMode;
         }
