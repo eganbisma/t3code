@@ -159,7 +159,7 @@ function isId(value: unknown): value is JsonRpcId {
  * absent fields as null (Codex sends `_meta: null`), which the MCP Apps SDK
  * rejects, dropping the whole notification or response.
  */
-export function normalizeMcpAppToolResult(result: McpAppCallToolResult): McpAppCallToolResult {
+function normalizeMcpAppToolResult(result: McpAppCallToolResult): McpAppCallToolResult {
   return {
     content: Array.isArray(result.content) ? result.content : [],
     ...(Predicate.isObject(result.structuredContent)
