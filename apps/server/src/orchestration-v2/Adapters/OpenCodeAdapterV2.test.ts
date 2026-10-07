@@ -41,6 +41,8 @@ import {
   cancelOpenCodePromptAdmission,
   openCodeBoundaryAfterProviderTurn,
   openCodeChildPermissionRules,
+  openCodePermissionDecision,
+  openCodePermissionRequestDecision,
   openCodePermissionRules,
   openCodePermissionRequestKind,
   openCodeToolProjectionKind,
@@ -2651,6 +2653,148 @@ describe("OpenCodeAdapterV2", () => {
     ]);
     assert.equal(permissionAction(childApprovalRules, "bash"), "ask");
     assert.equal(permissionAction(childApprovalRules, "task"), "deny");
+  });
+
+  it("decides permission requests the thread policy already answers instead of asking", () => {
+    // A child session under full access inherits only parent deny rules in
+    // OpenCode, so it asks on reads before T3 installs the parent policy. The
+    // routing path decides those requests from the parent policy itself.
+    const fullAccess = openCodePermissionRules(runtimePolicy("full-access"));
+    assert.equal(
+      openCodePermissionRequestDecision(fullAccess, {
+        id: "per_read",
+        sessionID: "ses_child",
+        permission: "read",
+        patterns: ["web/src/routes/settings.tsx"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "allow",
+    );
+    assert.equal(
+      openCodePermissionRequestDecision(fullAccess, {
+        id: "per_bash",
+        sessionID: "ses_child",
+        permission: "bash",
+        patterns: ["pnpm lint"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "allow",
+    );
+    // A request the policy does not decide still reaches the user.
+    assert.isUndefined(
+      openCodePermissionRequestDecision(fullAccess, {
+        id: "per_unknown",
+        sessionID: "ses_child",
+        permission: "custom_tool",
+        patterns: [],
+        metadata: {},
+        always: ["*"],
+      }),
+    );
+  });
+
+  it("still asks on environment files and denies what the sandbox forbids", () => {
+    // Implicit full access allows everything, including environment files:
+    // the user picked unrestricted access for the thread.
+    const fullAccess = openCodePermissionRules(runtimePolicy("full-access"));
+    assert.equal(
+      openCodePermissionRequestDecision(fullAccess, {
+        id: "per_env",
+        sessionID: "ses_child",
+        permission: "read",
+        patterns: ["web/.env"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "allow",
+    );
+
+    // In a supervised thread the environment-file rules are the user's
+    // explicit approval boundary: those requests still reach the user.
+    const approvalRequired = openCodePermissionRules(runtimePolicy("approval-required"));
+    assert.equal(
+      openCodePermissionRequestDecision(approvalRequired, {
+        id: "per_env_supervised",
+        sessionID: "ses_child",
+        permission: "read",
+        patterns: ["web/.env"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "ask",
+    );
+
+    // A read-only sandbox denies writes and commands outright: those are
+    // answered as rejections, not surfaced to the user.
+    const readOnly = openCodePermissionRules(
+      runtimePolicy("full-access", {
+        approvalPolicy: "never",
+        sandboxPolicy: {
+          type: "readOnly",
+          access: { type: "fullAccess" },
+          networkAccess: false,
+        },
+      }),
+    );
+    assert.equal(
+      openCodePermissionRequestDecision(readOnly, {
+        id: "per_edit",
+        sessionID: "ses_child",
+        permission: "edit",
+        patterns: ["web/src/routes/settings.tsx"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "deny",
+    );
+    assert.equal(
+      openCodePermissionRequestDecision(readOnly, {
+        id: "per_read_ok",
+        sessionID: "ses_child",
+        permission: "read",
+        patterns: ["web/src/routes/settings.tsx"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "allow",
+    );
+
+    // A supervised thread still asks on writes: those keep reaching the user.
+    assert.equal(
+      openCodePermissionRequestDecision(approvalRequired, {
+        id: "per_edit_ask",
+        sessionID: "ses_child",
+        permission: "edit",
+        patterns: ["web/src/routes/settings.tsx"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "ask",
+    );
+    assert.equal(
+      openCodePermissionRequestDecision(approvalRequired, {
+        id: "per_read_supervised",
+        sessionID: "ses_child",
+        permission: "read",
+        patterns: ["web/src/routes/settings.tsx"],
+        metadata: {},
+        always: ["*"],
+      }),
+      "allow",
+    );
+  });
+
+  it("mirrors OpenCode's last-match-wins wildcard evaluation", () => {
+    // OpenCode's own evaluation: the last matching rule wins, `*` spans path
+    // separators, and an unmatched request falls back to ask.
+    const rules = openCodePermissionRules(runtimePolicy("approval-required"));
+    assert.equal(openCodePermissionDecision(rules, "read", "web/.env"), "ask");
+    assert.equal(openCodePermissionDecision(rules, "read", "web/.env.local"), "ask");
+    assert.equal(openCodePermissionDecision(rules, "read", "web/.env.example"), "allow");
+    assert.equal(openCodePermissionDecision(rules, "read", "web/src/settings.tsx"), "allow");
+    assert.equal(openCodePermissionDecision(rules, "bash", "anything"), "ask");
   });
 
   it("uses the next native user message as the exclusive fork and revert boundary", () => {

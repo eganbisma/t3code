@@ -418,6 +418,10 @@ function topLevelRequestOwner(state: OpenCodeThreadState): OpenCodeRequestOwner 
   return owner.activeTurn === null ? undefined : { state: owner, turn: owner.activeTurn, subagent };
 }
 
+type RouteRuntimeRequestInput =
+  | { readonly type: "permission"; readonly value: PermissionRequest }
+  | { readonly type: "question"; readonly value: QuestionRequest };
+
 interface PendingOpenCodeRequest {
   readonly requestId: RuntimeRequestId;
   readonly nativeRequestId: string;
@@ -712,6 +716,59 @@ export function openCodePermissionRules(
   }
 
   return rules;
+}
+
+/**
+ * Mirror of OpenCode's permission check: the last matching rule wins, `*` in a
+ * rule's permission or pattern matches any run of characters (including path
+ * separators), and a request no rule matches falls back to `ask`. Deciding here
+ * the way OpenCode will once the session carries the policy keeps a
+ * pre-installed decision identical to the one it would reach itself.
+ */
+export function openCodePermissionDecision(
+  rules: PermissionRuleset,
+  permission: string,
+  pattern: string,
+): PermissionRuleset[number]["action"] {
+  return (
+    rules.findLast(
+      (rule) =>
+        openCodeWildcardMatch(permission, rule.permission) &&
+        openCodeWildcardMatch(pattern, rule.pattern),
+    )?.action ?? "ask"
+  );
+}
+
+function openCodeWildcardMatch(input: string, pattern: string): boolean {
+  const normalizedInput = input.replaceAll("\\", "/");
+  let escaped = pattern
+    .replaceAll("\\", "/")
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  if (escaped.endsWith(" .*")) escaped = escaped.slice(0, -3) + "( .*)?";
+  return new RegExp(`^${escaped}$`, "s").test(normalizedInput);
+}
+
+/**
+ * How OpenCode answers a whole permission request: it denies when any pattern
+ * denies, asks when any pattern is undecided or asked, and only allows when
+ * every pattern allows. `undefined` means the policy does not decide, so the
+ * request still needs the user.
+ */
+export function openCodePermissionRequestDecision(
+  rules: PermissionRuleset,
+  request: PermissionRequest,
+): PermissionRuleset[number]["action"] | undefined {
+  if (request.patterns.length === 0) return undefined;
+  const decisions = new Set(
+    request.patterns.map((pattern) =>
+      openCodePermissionDecision(rules, request.permission, pattern),
+    ),
+  );
+  if (decisions.has("deny")) return "deny";
+  if (decisions.has("ask")) return "ask";
+  return "allow";
 }
 
 function permissionRuleEquals(
@@ -1821,9 +1878,7 @@ export function makeOpenCodeAdapterV2(
         const emitRuntimeRequest = Effect.fnUntraced(function* (
           owner: OpenCodeRequestOwner,
           nativeRequestId: string,
-          request:
-            | { readonly type: "permission"; readonly value: PermissionRequest }
-            | { readonly type: "question"; readonly value: QuestionRequest },
+          request: RouteRuntimeRequestInput,
         ) {
           if (pendingRequestsByNativeId.has(nativeRequestId)) return;
           const { state, turn, subagent } = owner;
@@ -2003,6 +2058,48 @@ export function makeOpenCodeAdapterV2(
           return undefined;
         });
 
+        /** Answer a subagent child's permission request the thread's own policy
+         *  already decides instead of surfacing it. OpenCode task sessions
+         *  inherit only the parent's deny and external-directory rules, so a
+         *  child running under full access still asks on reads and commands
+         *  until its session rules are installed. Deciding here the way
+         *  OpenCode would keeps those requests out of the user's approval
+         *  queue. A request from the thread's own session is left alone: that
+         *  session carries the policy from creation, so its asks are real.
+         *  Returns true when the request was answered. */
+        const decideRuntimeRequest = Effect.fnUntraced(function* (
+          nativeRequestId: string,
+          owner: OpenCodeRequestOwner,
+          request: Extract<RouteRuntimeRequestInput, { readonly type: "permission" }>,
+        ) {
+          // The asking session is a child, not the thread's own session.
+          if (request.value.sessionID === owner.state.nativeSessionId) return false;
+          const decision = openCodePermissionRequestDecision(
+            openCodePermissionRules(owner.turn.runtimePolicy),
+            request.value,
+          );
+          if (decision === undefined || decision === "ask") return false;
+          rememberSettledRequest(nativeRequestId);
+          // A policy deny is answered as a rejection: the tool fails under the
+          // same rule it would have been denied by once its rules install. An
+          // allow is answered once: the session rules that land will govern
+          // everything after this request.
+          const reply = decision === "deny" ? ("reject" as const) : ("once" as const);
+          yield* sdkCall("permission.reply", { requestID: nativeRequestId, reply }, () =>
+            client.permission.reply({ requestID: nativeRequestId, reply }),
+          ).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to auto-answer an OpenCode permission request", {
+                nativeRequestId,
+                permission: request.value.permission,
+                reply,
+                cause: causeErrorTag(cause),
+              }),
+            ),
+          );
+          return true;
+        });
+
         /** Every request is asked on the top-level thread and its active turn,
          *  under the subagent that leads to the asking session, because native
          *  subagent threads are hidden from the sidebar. A child's request can
@@ -2014,9 +2111,7 @@ export function makeOpenCodeAdapterV2(
         const routeRuntimeRequest = Effect.fnUntraced(function* (
           nativeRequestId: string,
           sessionId: string,
-          request:
-            | { readonly type: "permission"; readonly value: PermissionRequest }
-            | { readonly type: "question"; readonly value: QuestionRequest },
+          request: RouteRuntimeRequestInput,
         ) {
           if (pendingChildRequestRoutes.has(nativeRequestId)) return;
           const attempt = Effect.gen(function* () {
@@ -2029,6 +2124,12 @@ export function makeOpenCodeAdapterV2(
             const state = yield* resolveSessionOwner(sessionId);
             const owner = state === undefined ? undefined : topLevelRequestOwner(state);
             if (owner === undefined) return false;
+            if (
+              request.type === "permission" &&
+              (yield* decideRuntimeRequest(nativeRequestId, owner, request))
+            ) {
+              return true;
+            }
             yield* emitRuntimeRequest(owner, nativeRequestId, request);
             return true;
           });
